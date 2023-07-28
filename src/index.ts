@@ -46,10 +46,10 @@ async function run() {
     core.debug(`prFilesWithBlobSize: ${JSON.stringify(prFilesWithBlobSize)}`);
 
     const largeFiles: string[] = [];
-    const accidentallyCheckedInLsfFiles: string[] = [];
+    const accidentallyCheckedInLfsFiles: string[] = [];
     for (const file of prFilesWithBlobSize) {
       const {fileblobsize, filename} = file;
-      if (fileblobsize !== null && fileblobsize > Number(fsl)) {
+      if (fileblobsize !== null && fileblobsize > Number(fsl) && !largeFiles.includes(filename)) {
         largeFiles.push(filename);
       } else {
         // look for files below threshold that should be stored in LFS but are not
@@ -70,27 +70,28 @@ async function run() {
             );
           }
 
-          if (!isStoredInLFS) {
-            accidentallyCheckedInLsfFiles.push(filename);
+          if (!isStoredInLFS && !accidentallyCheckedInLfsFiles.includes(filename)) {
+            accidentallyCheckedInLfsFiles.push(filename);
           }
         }
       }
     }
 
-    const lsfFiles = largeFiles.concat(accidentallyCheckedInLsfFiles);
+    // Filter out potential duplicates
+    const lfsFiles = [...new Set([...largeFiles, ...accidentallyCheckedInLfsFiles])];
 
     const issueBaseProps = {
       ...repo,
       issue_number: pullRequestNumber,
     };
 
-    if (lsfFiles.length > 0) {
+    if (lfsFiles.length > 0) {
       core.info('Detected file(s) that should be in LFS: ');
-      core.info(lsfFiles.join('\n'));
+      core.info(lfsFiles.join('\n'));
 
       const body = getCommentBody(
         largeFiles,
-        accidentallyCheckedInLsfFiles,
+        accidentallyCheckedInLfsFiles,
         fsl
       );
 
@@ -105,7 +106,7 @@ async function run() {
         }),
       ]);
 
-      core.setOutput('lfsFiles', lsfFiles);
+      core.setOutput('lfsFiles', lfsFiles);
       core.setFailed(
         'Large file(s) detected! Setting PR status to failed. Consider using git-lfs to track the LFS file(s)'
       );
@@ -177,25 +178,44 @@ async function getOrCreateLfsWarningLabel(
 }
 
 async function getPrFilesWithBlobSize(pullRequestNumber: number) {
-  const {data: dataWithRemoved} = await octokit.rest.pulls.listFiles({
+  // Maxes out at 250 commits
+  const commits = await octokit.paginate(octokit.rest.pulls.listCommits, {
     ...repo,
     pull_number: pullRequestNumber,
-  });
+    per_page: 100,
+  },
+  (response) => response.data.map((commit) => commit.sha));
 
-  const data = dataWithRemoved.filter(({status}) => status !== 'removed');
+  core.debug(`Checking commits: ${JSON.stringify(commits)}`);
+
+  const allFiles = await Promise.all(commits.map(async sha => {
+    const iterator = await octokit.paginate.iterator(octokit.rest.repos.getCommit, {
+      ...repo,
+      ref: sha,
+      per_page: 100,
+    });
+
+    const files = [];
+    for await (const {data: commit} of iterator) {
+      // No point in looking at removed files
+      files.push(...commit.files?.filter(({status}) => status !== 'removed') ?? []);
+    }
+
+    return files;
+  })).then(files => files.flat());
 
   const exclusionPatterns = core.getMultilineInput('exclusionPatterns');
 
   const files =
     exclusionPatterns.length > 0
-      ? data.filter(({filename}) => {
+      ? allFiles.filter(({filename}) => {
           const isExcluded = micromatch.isMatch(filename, exclusionPatterns);
           if (isExcluded) {
             core.info(`${filename} has been excluded from LFS warning`);
           }
           return !isExcluded;
         })
-      : data;
+      : allFiles;
 
   const prFilesWithBlobSize = await Promise.all(
     files
@@ -223,7 +243,7 @@ async function getPrFilesWithBlobSize(pullRequestNumber: number) {
 
 function getCommentBody(
   largeFiles: string[],
-  accidentallyCheckedInLsfFiles: string[],
+  accidentallyCheckedInLfsFiles: string[],
   fsl: string | number
 ) {
   const largeFilesBody = `The following file(s) exceeds the file size limit: ${fsl} bytes, as set in the .yml configuration files:
@@ -233,16 +253,16 @@ function getCommentBody(
         Consider using git-lfs to manage large files.
       `;
 
-  const accidentallyCheckedInLsfFilesBody = `The following file(s) are tracked in LFS and were likely accidentally checked in:
+  const accidentallyCheckedInLfsFilesBody = `The following file(s) are tracked in LFS and were likely accidentally checked in:
 
-        ${accidentallyCheckedInLsfFiles.join(', ')}
+        ${accidentallyCheckedInLfsFiles.join(', ')}
       `;
 
   const body = `## :warning: Possible file(s) that should be tracked in LFS detected :warning:
         ${largeFiles.length > 0 ? largeFilesBody : ''}
         ${
-          accidentallyCheckedInLsfFiles.length > 0
-            ? accidentallyCheckedInLsfFilesBody
+          accidentallyCheckedInLfsFiles.length > 0
+            ? accidentallyCheckedInLfsFilesBody
             : ''
         }`;
   return body;
